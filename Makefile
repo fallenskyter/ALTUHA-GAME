@@ -1,20 +1,16 @@
 TARGET = DUSKCRUSHER
-OBJS   = src/main.o
+OBJS = main.o
 
-CFLAGS   = -O2 -G0 -Wall -ffast-math
+CFLAGS = -O2 -G0 -Wall
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
-ASFLAGS  = $(CFLAGS)
-LIBS     = -lpspaudio -lpspdisplay -lpspctrl -lpspge -lpsppower -lm
+ASFLAGS = $(CFLAGS)
 
-EXTRA_TARGETS   = EBOOT.PBP
+LIBS = -lpspaudio -lpspgu -lpspdisplay -lpspctrl -lm
+
+BUILD_PRX = 1
+EXTRA_TARGETS = EBOOT.PBP
 PSP_EBOOT_TITLE = DUSK CRUSHER
+PSP_EBOOT_ICON = ICON0.PNG
 
-PSPSDK = $(shell psp-config --pspsdk-path)
+PSPSDK := $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
-
-# Zips a ready-to-copy PSP/GAME/DUSKCRUSHER folder
-package: EBOOT.PBP
-	rm -rf dist && mkdir -p dist/PSP/GAME/DUSKCRUSHER
-	cp EBOOT.PBP dist/PSP/GAME/DUSKCRUSHER/
-	cp -r assets dist/PSP/GAME/DUSKCRUSHER/
-	cd dist && zip -r ../DUSKCRUSHER_PSP.zip PSP
