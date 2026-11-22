@@ -1,0 +1,22 @@
+name: Build DUSK CRUSHER
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Package
+        run: |
+          mkdir -p out/PSP/GAME/DUSKCRUSHER
+          cp EBOOT.PBP out/PSP/GAME/DUSKCRUSHER/
+          cp -r assets out/PSP/GAME/DUSKCRUSHER/assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DUSKCRUSHER
+          path: out
