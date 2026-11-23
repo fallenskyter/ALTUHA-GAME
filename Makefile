@@ -1,11 +1,11 @@
 TARGET = DUSKCRUSHER
 OBJS = main.o
 
-CFLAGS = -O2 -G0 -Wall
+CFLAGS = -O3 -ffast-math -fno-math-errno -G0 -Wall
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
-LIBS = -lpspaudio -lpspgu -lpspdisplay -lpspctrl -lm
+LIBS = -lpspaudio -lpspgu -lpspdisplay -lpspctrl -lpsppower -lm
 
 BUILD_PRX = 1
 EXTRA_TARGETS = EBOOT.PBP

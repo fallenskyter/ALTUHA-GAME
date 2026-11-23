@@ -6,6 +6,7 @@
 #include <pspdisplay.h>
 #include <pspgu.h>
 #include <pspctrl.h>
+#include <psppower.h>
 #include <pspaudio.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,9 +43,19 @@ static VT __attribute__((aligned(16))) tvBody[2][6];
 static VT __attribute__((aligned(16))) tvCity[6];
 static VT __attribute__((aligned(16))) tvPort[6];
 static unsigned int __attribute__((aligned(16))) bootTex[NPOSE][256 * 256];
-static unsigned int __attribute__((aligned(16))) cityTex[512 * 512];
 static unsigned int __attribute__((aligned(16))) portTex[14][64 * 64];
 static int bootOk[NPOSE], cityOk = 0, portOk[14];
+/* VRAM: draw 0x0, disp 0x88000, depth 0x110000; city textures live behind them (read from VRAM = fast) */
+#define VRAM_CITY_TOP 0x154000
+#define VRAM_CITY_BOT 0x194000
+#ifdef SIM_BUILD
+static unsigned char simVram[0x200000];
+#define VRAM_CPU(off) ((void *)(simVram + (off)))
+#define VRAM_GE(off) ((void *)(simVram + (off)))
+#else
+#define VRAM_CPU(off) ((void *)(0x44000000 + (off)))
+#define VRAM_GE(off) ((void *)(0x04000000 + (off)))
+#endif
 
 static char base[256] = "";
 static float shakeX = 0, shakeY = 0;
@@ -116,15 +127,19 @@ static void triP(float x0, float y0, float x1, float y1, float x2, float y2, uns
 static void quadP(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, unsigned int c) {
   triP(x0, y0, x1, y1, x2, y2, c); triP(x0, y0, x2, y2, x3, y3, c);
 }
+static float ecos[13], esin[13]; static int etabInit = 0;
 static void ellipseP(float cx, float cy, float rx, float ry, float rot, unsigned int c) {
-  int segs = (rx > 7 || ry > 7) ? 14 : ((rx > 3 || ry > 3) ? 10 : 6), i;
-  float cr = cosf(rot), sr = sinf(rot), px = 0, py = 0, fx = 0, fy = 0;
+  int segs, step, i, n; float cr = 1, sr = 0, px = 0, py = 0;
+  if (!etabInit) { for (i = 0; i <= 12; i++) { ecos[i] = cosf(6.2831853f * i / 12); esin[i] = sinf(6.2831853f * i / 12); } etabInit = 1; }
   if (rx < 0.4f && ry < 0.4f) return;
-  for (i = 0; i <= segs; i++) {
-    float a = 6.2831853f * i / segs, ex = cosf(a) * rx, ey = sinf(a) * ry;
+  if (cx + rx < -4 || cx - rx > 484 || cy + ry < -4 || cy - ry > 276) return;
+  if (rx > 5 || ry > 5) { segs = 12; step = 1; } else { segs = 6; step = 2; }
+  if (rot != 0) { cr = cosf(rot); sr = sinf(rot); }
+  for (i = 0, n = 0; n <= segs; n++, i += step) {
+    float ex = ecos[i] * rx, ey = esin[i] * ry;
     float x = cx + ex * cr - ey * sr, y = cy + ex * sr + ey * cr;
-    if (i > 0) triP(cx, cy, px, py, x, y, c);
-    px = x; py = y; (void)fx; (void)fy;
+    if (n > 0) triP(cx, cy, px, py, x, y, c);
+    px = x; py = y;
   }
 }
 /* world-space helpers (canvas units, zoomed) */
@@ -141,7 +156,7 @@ static void lineW(float x1, float y1, float x2, float y2, float w, unsigned int 
   if (len < 0.001f) { ellipseP(ax, ay, hw, hw, 0, c); return; }
   nx = -dy / len * hw; ny = dx / len * hw;
   quadP(ax + nx, ay + ny, bx + nx, by + ny, bx - nx, by - ny, ax - nx, ay - ny, c);
-  if (hw > 1.6f) { ellipseP(ax, ay, hw, hw, 0, c); ellipseP(bx, by, hw, hw, 0, c); }
+  if (hw > 3.2f) { ellipseP(ax, ay, hw, hw, 0, c); ellipseP(bx, by, hw, hw, 0, c); }
 }
 static void flushBatch(Batch *b) {
   int i;
@@ -181,12 +196,19 @@ static void textP(float x, float y, const char *s, unsigned int c, int sc) {
     else if (ch >= 'a' && ch <= 'z') id = 11 + ch - 'a';
     else if (ch == '+') id = 37; else if (ch == ':') id = 38; else if (ch == '-') id = 39; else if (ch == '.') id = 40;
     if (id == 0) continue;
-    for (yy = 0; yy < 7; yy++)
-      for (xx = 0; xx < 5; xx++)
-        if (glyph[id][yy] & (1 << (4 - xx))) rectP(x + xx * sc, y + yy * sc, sc, sc, c);
+    for (yy = 0; yy < 7; yy++) {
+      xx = 0;
+      while (xx < 5) {
+        if (glyph[id][yy] & (1 << (4 - xx))) {
+          int run = 1;
+          while (xx + run < 5 && (glyph[id][yy] & (1 << (4 - xx - run)))) run++;
+          rectP(x + xx * sc, y + yy * sc, run * sc, sc, c);
+          xx += run;
+        } else xx++;
+      }
+    }
   }
 }
-
 /* ---------- audio: sfx pool + loop voices + streamed music, mixed in a thread ---------- */
 #define POOL_MAX 500000
 #define NV 16
@@ -244,6 +266,7 @@ static int audioMain(SceSize args, void *argp) {
       float pos, rate, gain, k;
       int len;
       if (!vo->active || !vo->p) continue;
+      if (vo->loop && vo->gain < 0.0008f && vo->target < 0.0008f) { vo->gain = 0; continue; }
       k = 1.0f - expf(-blockDt / vo->tc);
       vo->gain += (vo->target - vo->gain) * k;
       gain = vo->gain / 32768.0f; pos = vo->pos; rate = vo->rate * 0.5f; len = vo->len;
@@ -609,9 +632,9 @@ static void quadVT(VT *v, const float *xs, const float *ys, float u0, float v0, 
   us[0] = u0; vs[0] = v0; us[1] = u1; vs[1] = v0; us[2] = u1; vs[2] = v1; us[3] = u0; vs[3] = v1;
   for (i = 0; i < 6; i++) { int k = idx[i]; v[i].u = us[k]; v[i].v = vs[k]; v[i].c = c; v[i].x = xs[k]; v[i].y = ys[k]; v[i].z = 0; }
 }
-static void texBind(const unsigned int *tex, int tw, int th, int linear) {
+static void texBind(const void *tex, int tw, int th, int linear, int psm, int swz) {
   sceGuEnable(GU_TEXTURE_2D);
-  sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+  sceGuTexMode(psm, 0, 0, swz);
   sceGuTexImage(0, tw, th, tw, tex);
   sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
   sceGuTexFilter(linear ? GU_LINEAR : GU_NEAREST, linear ? GU_LINEAR : GU_NEAREST);
@@ -634,7 +657,7 @@ static void footDraw(const Foot *f, int slot) {
   unsigned int tint = f->isBack ? 0xffc2c2c2u : 0xffffffffu;
   int i;
   if (!bootOk[f->poseIdx]) return;
-  texBind(bootTex[f->poseIdx], p->tw, p->th, 1);
+  texBind(bootTex[f->poseIdx], p->tw, p->th, 1, GU_PSM_8888, 1);
 #define XFORM(LX, LY, OX, OY) do { float a_ = (LX) * f->squashX, b_ = (LY) * f->squashY; a_ += b_ * f->smearShear; \
     float xr_ = a_ * c - b_ * s, yr_ = a_ * s + b_ * c; (OX) = wX(cx + xr_); (OY) = wY(cy + yr_); } while (0)
   lx[0] = pLeft - extH * sh;      ly[0] = extY - extH;
@@ -691,10 +714,10 @@ typedef struct { float x1, y1, x2, y2, w, alpha, age; } Smear;
 typedef struct { float x, y, vx, vy, r, life; } GPart;
 typedef struct { Foot *foot; float u, gx, gy, thickness, maxLen, sag; } Strand;
 typedef struct { float x, y, r, maxR, alpha; } Shock;
-#define MAX_PUDDLE 140
-#define MAX_SMEAR 145
-#define MAX_GPART 260
-#define MAX_STRAND 64
+#define MAX_PUDDLE 70
+#define MAX_SMEAR 70
+#define MAX_GPART 130
+#define MAX_STRAND 36
 #define MAX_SHOCK 8
 static Puddle puddles[MAX_PUDDLE]; static int puddleN = 0;
 static Smear smears[MAX_SMEAR]; static int smearN = 0;
@@ -797,26 +820,22 @@ static void gooUpdate(float dt) {
 }
 static unsigned int ca(int r, int g, int b, float a) { return col(r, g, b, (int)(clampf(a, 0, 1) * 255)); }
 static void gooDrawGround(void) {
-  int i, k;
+  int i;
   for (i = 0; i < smearN; i++) {
     Smear *m = &smears[i]; float a = m->alpha;
     lineW(m->x1, m->y1, m->x2, m->y2, m->w, ca(5, 5, 6, a));
-    lineW(m->x1, m->y1 + m->w * 0.42f, lerpf(m->x1, m->x2, 0.82f), m->y2 + m->w * 0.42f, maxf(2, m->w * 0.34f), ca(8, 8, 13, a * 0.85f));
-    lineW(lerpf(m->x1, m->x2, 0.14f), m->y1 - m->w * 0.44f, m->x2, m->y2 - m->w * 0.44f, maxf(2, m->w * 0.34f), ca(8, 8, 13, a * 0.85f));
-    lineW(m->x1, m->y1 - m->w * 0.18f, m->x2, m->y2 - m->w * 0.18f, maxf(1.4f, m->w * 0.24f), ca(42, 42, 44, 0.36f * a));
+    lineW(m->x1, m->y1 - m->w * 0.18f, m->x2, m->y2 - m->w * 0.18f, maxf(1.4f, m->w * 0.24f), ca(30, 30, 34, 0.34f * a));
   }
   for (i = 0; i < puddleN; i++) {
     Puddle *p = &puddles[i]; float sp = p->spread;
-    for (k = 0; k < 3; k++) ellipseW(p->x + p->lobe[k].ox * sp, p->y + p->lobe[k].oy * sp, p->rx * p->lobe[k].sx * sp, p->ry * p->lobe[k].sy * sp, 0, ca(5, 5, 6, p->alpha));
-    ellipseW(p->x - p->rx * 0.22f * sp, p->y - p->ry * 0.24f * sp, p->rx * 0.40f * sp, p->ry * 0.24f * sp, 0, ca(38, 38, 40, 0.34f * p->alpha));
+    ellipseW(p->x, p->y, p->rx * sp, p->ry * sp, 0, ca(5, 5, 6, p->alpha));
+    ellipseW(p->x + p->lobe[1].ox * sp, p->y + p->lobe[1].oy * sp, p->rx * p->lobe[1].sx * sp, p->ry * p->lobe[1].sy * sp, 0, ca(5, 5, 6, p->alpha));
+    ellipseW(p->x - p->rx * 0.22f * sp, p->y - p->ry * 0.24f * sp, p->rx * 0.40f * sp, p->ry * 0.24f * sp, 0, ca(38, 38, 40, 0.30f * p->alpha));
   }
   for (i = 0; i < shockN; i++) {
-    Shock *s = &shocks[i]; float px = 0, py = 0;
-    for (k = 0; k <= 18; k++) {
-      float a = 6.2831853f * k / 18, x = s->x + cosf(a) * s->r, y = s->y + sinf(a) * s->r * 0.16f;
-      if (k > 0) lineW(px, py, x, y, 2.5f, ca(155, 184, 255, s->alpha));
-      px = x; py = y;
-    }
+    Shock *s = &shocks[i];
+    ellipseW(s->x, s->y, s->r, s->r * 0.16f, 0, ca(155, 184, 255, s->alpha * 0.22f));
+    ellipseW(s->x, s->y, s->r * 0.93f, s->r * 0.14f, 0, ca(8, 5, 14, s->alpha * 0.18f));
   }
 }
 static void gooDrawStrands(const Foot *foot) {
@@ -830,8 +849,8 @@ static void gooDrawStrands(const Foot *foot) {
     w = maxf(1.2f, s->thickness * (1 - stretch * 0.70f)); rootR = w * 1.45f;
     ellipseW(px, py, rootR * 1.15f, rootR * 0.65f, 0, RGB(5, 5, 6));
     ellipseW(s->gx, s->gy, rootR * 1.35f, rootR * 0.55f, 0, RGB(5, 5, 6));
-    for (k = 0; k <= 8; k++) {
-      float t = k / 8.0f, o = 1 - t, x = o * o * px + 2 * o * t * midX + t * t * s->gx, y = o * o * py + 2 * o * t * midY + t * t * s->gy;
+    for (k = 0; k <= 5; k++) {
+      float t = k / 5.0f, o = 1 - t, x = o * o * px + 2 * o * t * midX + t * t * s->gx, y = o * o * py + 2 * o * t * midY + t * t * s->gy;
       if (k > 0) lineW(qx, qy, x, y, w, RGB(5, 5, 6));
       qx = x; qy = y;
     }
@@ -846,7 +865,7 @@ static void gooDrawParticles(void) {
   for (i = 0; i < gpartN; i++) {
     GPart *p = &gparts[i]; float spd = hypotf(p->vx, p->vy), ang = atan2f(p->vy, p->vx), stretch = clampf(1 + spd / 420.0f, 1, 2.35f);
     ellipseW(p->x, p->y, p->r * stretch, p->r * 0.82f, ang, RGB(5, 5, 6));
-    if (p->r > 2.8f) ellipseW(p->x + p->r * 0.2f, p->y - p->r * 0.22f, p->r * 0.42f * stretch, p->r * 0.24f, ang, col(52, 52, 55, 92));
+    if (p->r > 5.5f) ellipseW(p->x + p->r * 0.2f, p->y - p->r * 0.22f, p->r * 0.42f * stretch, p->r * 0.24f, ang, col(52, 52, 55, 92));
   }
 }
 /* ---------- enemies (exact port) ---------- */
@@ -1096,19 +1115,21 @@ static void motesUpdate(float dt) {
     if (m->y > ASPHALT_TOP - 15) m->y = 40;
   }
 }
-/* textured backdrop (pre-rendered from the HTML CityBackground, zoom + shake margins baked in) */
+/* textured backdrop: dithered RGB565 copy of the HTML city, kept in VRAM in two pieces (512x256 + 512x64) */
 static void drawCityTex(void) {
   float x0 = -16 + shakeX * K, y0 = -8 + shakeY * K, xs[4], ys[4];
   if (!cityOk) return;
-  xs[0] = x0; ys[0] = y0; xs[1] = x0 + 512; ys[1] = y0; xs[2] = x0 + 512; ys[2] = y0 + 288; xs[3] = x0; ys[3] = y0 + 288;
-  texBind(cityTex, 512, 512, 0);
-  quadVT(tvCity, xs, ys, 0, 0, 512, 288, 0xffffffffu);
-  texDraw(tvCity);
+  xs[0] = x0; ys[0] = y0; xs[1] = x0 + 512; ys[1] = y0; xs[2] = x0 + 512; ys[2] = y0 + 256; xs[3] = x0; ys[3] = y0 + 256;
+  texBind(VRAM_GE(VRAM_CITY_TOP), 512, 256, 0, GU_PSM_5650, 1);
+  quadVT(tvCity, xs, ys, 0, 0, 512, 256, 0xffffffffu); texDraw(tvCity);
+  ys[0] = y0 + 256; ys[1] = y0 + 256; ys[2] = y0 + 288; ys[3] = y0 + 288;
+  texBind(VRAM_GE(VRAM_CITY_BOT), 512, 64, 0, GU_PSM_5650, 1);
+  quadVT(tvCity, xs, ys, 0, 0, 512, 32, 0xffffffffu); texDraw(tvCity);
   sceGuDisable(GU_TEXTURE_2D);
 }
 static void glowW(float cx, float cy, float r, int R, int G, int B, float a) {
   int i;
-  for (i = 0; i < 4; i++) ellipseW(cx, cy, r * (1 - i * 0.24f), r * (1 - i * 0.24f), 0, ca(R, G, B, a * 0.30f));
+  for (i = 0; i < 2; i++) ellipseW(cx, cy, r * (1 - i * 0.45f), r * (1 - i * 0.45f), 0, ca(R, G, B, a * 0.55f));
 }
 static void drawCityAnim(float time) {
   float flicker = (sinf(time * 23) > 0.96f) ? 0.03f : 1.0f, p = (0.09f + sinf(time * 2.8f) * 0.035f) * flicker;
@@ -1116,7 +1137,7 @@ static void drawCityAnim(float time) {
   glowW(308, 380, 170, 40, 200, 170, p);
   glowW(32, 280, 125, 255, 110, 175, p * 1.08f);
   glowW(95, 546, 72, 255, 220, 90, 0.11f + sinf(time * 4.2f) * 0.04f);
-  for (i = 0; i < 36; i++) ellipseW(motes[i].x, motes[i].y, motes[i].r, motes[i].r, 0, ca(235, 195, 225, 0.18f + sinf(motes[i].phase) * 0.10f));
+  for (i = 0; i < 36; i += 2) ellipseW(motes[i].x, motes[i].y, motes[i].r, motes[i].r, 0, ca(235, 195, 225, 0.18f + sinf(motes[i].phase) * 0.10f));
 }
 
 /* ---------- portrait renderer (exact port) ---------- */
@@ -1174,7 +1195,7 @@ static void portraitDrawTex(void) {
   sceGuScissor((int)((PX + 5) * K), (int)((PY + 5) * K), (int)ceilf((PX + PW - 5) * K), (int)ceilf((PY + PH - 5) * K));
   x0 = pview.dx * K; y0 = pview.dy * K; x1 = (pview.dx + pview.tw) * K; y1 = (pview.dy + pview.th) * K;
   xs[0] = x0; ys[0] = y0; xs[1] = x1; ys[1] = y0; xs[2] = x1; ys[2] = y1; xs[3] = x0; ys[3] = y1;
-  texBind(portTex[pview.fIdx], 64, 64, 1);
+  texBind(portTex[pview.fIdx], 64, 64, 1, GU_PSM_8888, 1);
   quadVT(tvPort, xs, ys, 0, 0, 62, 64, 0xffffffffu);
   texDraw(tvPort);
   sceGuDisable(GU_TEXTURE_2D);
@@ -1515,11 +1536,12 @@ static void gu_init(void) {
 
 int main(int argc, char **argv) {
   char m[400]; int i, loaded = 0, ploaded = 0, sc;
-  SceCtrlData pad; unsigned int prevBtn = 0; unsigned long long last; unsigned int frameNo = 0;
+  SceCtrlData pad; unsigned int prevBtn = 0; unsigned long long last; unsigned int frameNo = 0; float accBuild = 0, accSubmit = 0;
   FILE *lf = fopen("ms0:/DUSKLOG.TXT", "wb"); if (lf) fclose(lf);
   setup_cb();
   pspDebugScreenInit();
-  say("DUSK CRUSHER (C build, stage 2)");
+  scePowerSetClockFrequency(333, 333, 166);
+  say("DUSK CRUSHER (C build, stage 2b, 333MHz)");
   if (argc > 0 && argv && argv[0]) {
     char *sl; strncpy(base, argv[0], sizeof(base) - 1); sl = strrchr(base, '/'); if (sl) sl[1] = 0; else base[0] = 0;
   }
@@ -1534,8 +1556,12 @@ int main(int argc, char **argv) {
     portOk[i] = (loadFile(ap(p), portTex[i], 64 * 64 * 4) == 64 * 64 * 4);
     if (portOk[i]) { sceKernelDcacheWritebackRange(portTex[i], 64 * 64 * 4); ploaded++; }
   }
-  cityOk = (loadFile(ap("assets/city.rgba"), cityTex, 512 * 512 * 4) == 512 * 512 * 4);
-  if (cityOk) sceKernelDcacheWritebackRange(cityTex, 512 * 512 * 4);
+  { static unsigned char cbuf[65536]; int ok1 = 0, ok2 = 0, n, tot;
+    FILE *fc = fopen(ap("assets/city_top.565"), "rb");
+    if (fc) { tot = 0; while ((n = (int)fread(cbuf, 1, sizeof(cbuf), fc)) > 0 && tot + n <= 0x40000) { memcpy((unsigned char *)VRAM_CPU(VRAM_CITY_TOP) + tot, cbuf, n); tot += n; } fclose(fc); ok1 = (tot == 0x40000); }
+    fc = fopen(ap("assets/city_bot.565"), "rb");
+    if (fc) { tot = 0; while ((n = (int)fread(cbuf, 1, sizeof(cbuf), fc)) > 0 && tot + n <= 0x10000) { memcpy((unsigned char *)VRAM_CPU(VRAM_CITY_BOT) + tot, cbuf, n); tot += n; } fclose(fc); ok2 = (tot == 0x10000); }
+    cityOk = ok1 && ok2; }
   snprintf(m, sizeof(m), "boots %d/%d  portraits %d/14  city %d", loaded, NPOSE, ploaded, cityOk); say(m);
   sc = loadSfx(); snprintf(m, sizeof(m), "sfx pack: %d sounds", sc); say(m);
   sceKernelDelayThread(1200000);
@@ -1567,9 +1593,12 @@ int main(int argc, char **argv) {
     musicPaused = paused; musicTarget = (musicWant && !muted) ? MUSIC_VOL : 0.0f;
     if (!paused) engineUpdate(dt, &pad, pressed, released);
     else { audioSmearUpdate(0, 0, 0, 0, 0, 0); audioDescent(0, 1); }
-    buildFrame();
-    submitFrame();
+    { unsigned long long t0 = sceKernelGetSystemTimeWide(), t1, t2;
+      buildFrame(); t1 = sceKernelGetSystemTimeWide();
+      submitFrame(); t2 = sceKernelGetSystemTimeWide();
+      accBuild += (float)(t1 - t0); accSubmit += (float)(t2 - t1); }
     frameNo++;
+    if (frameNo % 300 == 0) { snprintf(m, sizeof(m), "frame %u: avg build %.1f ms, submit(+vsync) %.1f ms, ants %d goo p%d s%d", frameNo, accBuild / 300000.0f, accSubmit / 300000.0f, antN, puddleN, smearN); logf_(m); accBuild = accSubmit = 0; }
     if (frameNo == 1 || frameNo == 60 || frameNo == 600) {
       snprintf(m, sizeof(m), "frame %u ok (A=%d B=%d C=%d D=%d E=%d)", frameNo, bA.n, bB.n, bC.n, bD.n, bE.n); logf_(m);
     }
