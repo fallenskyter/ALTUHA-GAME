@@ -1,4 +1,4 @@
-/* DUSK CRUSHER - native PSP port (plain C), stage 2
+/* ALTUHA GAME - native PSP port (plain C), stage 2
  * Game logic runs in the original 1280x720 canvas units and is scaled by
  * K = 480/1280 only when vertices are emitted. */
 #include <pspkernel.h>
@@ -15,7 +15,7 @@
 #include "poses.h"
 #include "sfx_ids.h"
 
-PSP_MODULE_INFO("DUSKCRUSHER", 0, 1, 0);
+PSP_MODULE_INFO("ALTUHAGAME", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 
 #define CW 1280.0f
@@ -1596,7 +1596,7 @@ int main(int argc, char **argv) {
   setup_cb();
   pspDebugScreenInit();
   scePowerSetClockFrequency(333, 333, 166);
-  say("DUSK CRUSHER (C build, stage 2b, 333MHz)");
+  say("ALTUHA GAME (C build, stage 2b, 333MHz)");
   if (argc > 0 && argv && argv[0]) {
     char *sl; strncpy(base, argv[0], sizeof(base) - 1); sl = strrchr(base, '/'); if (sl) sl[1] = 0; else base[0] = 0;
   }
