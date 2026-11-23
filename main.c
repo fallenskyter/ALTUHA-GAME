@@ -60,6 +60,7 @@ static unsigned char simVram[0x200000];
 static char base[256] = "";
 static float shakeX = 0, shakeY = 0;
 static int useZoom = 1;
+static float gPsycho = 0;   /* 0..1, ramps up while the music (psycho mode) is on */
 /* ---------- helpers ---------- */
 static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
 static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
@@ -203,6 +204,37 @@ static void textP(float x, float y, const char *s, unsigned int c, int sc) {
           int run = 1;
           while (xx + run < 5 && (glyph[id][yy] & (1 << (4 - xx - run)))) run++;
           rectP(x + xx * sc, y + yy * sc, run * sc, sc, c);
+          xx += run;
+        } else xx++;
+      }
+    }
+  }
+}
+
+/* tiny 3x5 font (digits, A-Z, + : - .) for the small HUD text */
+static const unsigned char tiny[41][5] = {
+  {0,0,0,0,0},
+  {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},{7,4,7,1,7},{7,4,7,5,7},{7,1,2,2,2},{7,5,7,5,7},{7,5,7,1,7},
+  {2,5,7,5,5},{6,5,6,5,6},{3,4,4,4,3},{6,5,5,5,6},{7,4,6,4,7},{7,4,6,4,4},{3,4,5,5,3},{5,5,7,5,5},{7,2,2,2,7},{1,1,1,5,2},
+  {5,5,6,5,5},{4,4,4,4,7},{5,7,7,5,5},{6,5,5,5,5},{2,5,5,5,2},{6,5,6,4,4},{2,5,5,6,3},{6,5,6,5,5},{3,4,2,1,6},{7,2,2,2,2},
+  {5,5,5,5,7},{5,5,5,5,2},{5,5,7,7,5},{5,5,2,5,5},{5,5,2,2,2},{7,1,2,4,7},
+  {0,2,7,2,0},{0,2,0,2,0},{0,0,7,0,0},{0,0,0,0,2}
+};
+static void textS(float x, float y, const char *s, unsigned int c) {
+  for (; *s; s++, x += 4) {
+    int id = 0, yy, xx; char ch = *s;
+    if (ch >= '0' && ch <= '9') id = 1 + ch - '0';
+    else if (ch >= 'A' && ch <= 'Z') id = 11 + ch - 'A';
+    else if (ch >= 'a' && ch <= 'z') id = 11 + ch - 'a';
+    else if (ch == '+') id = 37; else if (ch == ':') id = 38; else if (ch == '-') id = 39; else if (ch == '.') id = 40;
+    if (id == 0) continue;
+    for (yy = 0; yy < 5; yy++) {
+      xx = 0;
+      while (xx < 3) {
+        if (tiny[id][yy] & (1 << (2 - xx))) {
+          int run = 1;
+          while (xx + run < 3 && (tiny[id][yy] & (1 << (2 - xx - run)))) run++;
+          rectP(x + xx, y + yy, run, 1, c);
           xx += run;
         } else xx++;
       }
@@ -576,8 +608,8 @@ static void footUpdate(Foot *f, float dt, int activeDrag, float time) {
   else if (f->isGrounded) f->peelStrandsSpawned = 0;
   hover = (!f->isGrounded && !activeDrag && !peeling) ? sinf(time * 2.4f + (f->isBack ? 1.6f : 0)) * 5 : 0;
   effStX = peeling ? stiffX * 0.42f : stiffX;
-  f->x += (f->tx - f->x) * minf(1, effStX * dt);
-  f->y += (f->ty + hover - f->y) * minf(1, stiffY * dt);
+  f->x += (f->tx - f->x) * minf(1, effStX * dt * (1 + 0.65f * gPsycho));
+  f->y += (f->ty + hover - f->y) * minf(1, stiffY * dt * (1 + 0.65f * gPsycho));
   f->vx = (f->x - prevX) / maxf(0.001f, dt); f->vy = (f->y - prevY) / maxf(0.001f, dt);
   f->isGrounded = f->y >= f->groundY - 5;
   if (f->isGrounded) f->isSlamming = 0;
@@ -923,12 +955,12 @@ static void enemiesUpdate(float dt, Foot *front, Foot *back, float speedMult) {
   feet[0] = front; feet[1] = back;
   spawnTimer -= dt;
   if (spawnTimer <= 0) {
-    int deficit = 82 - antN; int batch, k; float side; int wave;
+    int deficit = (int)(82 + 40 * gPsycho) - antN; int batch, k; float side; int wave;
     if (deficit < 0) deficit = 0;
-    batch = deficit > 35 ? rndi(6, 12) : rndi(3, 6);
+    batch = deficit > 35 ? rndi(6, 12) : rndi(3, 6); batch = (int)(batch * (1 + 0.8f * gPsycho));
     side = (rand() % 2) ? -16.0f : CW + 16.0f; wave = (rand() % 100) < 78;
     for (k = 0; k < batch; k++) spawnAnt(wave ? side + (side < 0 ? -k * 12.0f : k * 12.0f) : 0, wave);
-    spawnTimer = deficit > 30 ? rnd(0.18f, 0.36f) : rnd(0.36f, 0.72f);
+    spawnTimer = (deficit > 30 ? rnd(0.18f, 0.36f) : rnd(0.36f, 0.72f)) * (1 - 0.5f * gPsycho);
   }
   trashTimer -= dt;
   if (trashTimer <= 0) { spawnTrash(0, 0); trashTimer = rnd(4.5f, 8.5f); }
@@ -992,7 +1024,7 @@ static void evaluateContact(Foot *foot, int mode, int comboMult, float dt, float
   float yMin = ASPHALT_TOP - 4, yMax = CURB_TOP + 8;
   KillRes res; int i, nKilled = 0; float cx = 0, cy = 0;
   float smearStrength = 1 + heartPower * 0.95f;
-  float grindRate = (0.48f + fabsf(foot->vx) * 0.026f + fabsf(foot->angleVel) * 1.8f) * smearStrength * dt;
+  float grindRate = (0.48f + fabsf(foot->vx) * 0.026f + fabsf(foot->angleVel) * 1.8f) * smearStrength * dt * (1 + 0.9f * gPsycho);
   static float kx[MAX_ANTS], ky[MAX_ANTS];
   memset(&res, 0, sizeof(res));
 
@@ -1232,6 +1264,12 @@ static void textShadow(float xc, float yc, const char *s, unsigned int c, float 
   textP(x, y, s, (c & 0x00ffffffu) | ((unsigned)a << 24), 1);
 }
 static float textWidthC(const char *s) { return (float)strlen(s) * 6.0f / K; }
+static void textShadowS(float xc, float yc, const char *s, unsigned int c, float alpha) {
+  float x = xc * K, y = yc * K - 2.5f; int a = (int)(clampf(alpha, 0, 1) * 255);
+  textS(x + 1, y + 1, s, col(9, 6, 14, a));
+  textS(x, y, s, (c & 0x00ffffffu) | ((unsigned)a << 24));
+}
+static float textWidthS(const char *s) { return (float)strlen(s) * 4.0f / K; }
 static void drawHeartIcon(float xc, float yc, float fill) {
   static const char *shape[6] = { ".XX.XX.", "XXXXXXX", "XXXXXXX", ".XXXXX.", "..XXX..", "...X..." };
   int r, c; float x0 = xc * K - 3.5f, y0 = yc * K - 3.0f; int full = fill >= 0.99f;
@@ -1256,29 +1294,28 @@ static void drawHudScreen(float time, int hasInter, float hintT) {
     rectP(hx - 3, hy - 4, 6, 1, RGB(230, 220, 235)); rectP(hx - 3, hy + 3, 6, 1, RGB(230, 220, 235));
     triP(hx - 2.5f, hy - 3, hx + 2.5f, hy - 3, hx, hy, RGB(230, 220, 235)); triP(hx - 2.5f, hy + 3, hx + 2.5f, hy + 3, hx, hy, RGB(230, 220, 235)); }
   secs = (int)hud.elapsed; snprintf(num, sizeof(num), "%02d:%02d:%02d", secs / 3600, (secs % 3600) / 60, secs % 60);
-  textShadow(52, y, num, RGB(245, 238, 248), 1);
+  textShadowS(48, y, num, RGB(245, 238, 248), 1);
   /* pile icon + kills */
   pulse = hud.comboKills > 0 ? 1 + sinf(time * 14) * 0.14f : 1;
-  { float px_ = 206 * K, py_ = y * K; unsigned int pc = hud.comboKills > 0 ? RGB(255, 46, 77) : RGB(138, 114, 150);
+  { float px_ = 160 * K, py_ = y * K; unsigned int pc = hud.comboKills > 0 ? RGB(255, 46, 77) : RGB(138, 114, 150);
     ellipseP(px_ - 5.5f * K * pulse, py_ + 3.5f * K * pulse, 5 * K * pulse, 5 * K * pulse, 0, pc);
     ellipseP(px_ + 5.5f * K * pulse, py_ + 3.5f * K * pulse, 5 * K * pulse, 5 * K * pulse, 0, pc);
-    ellipseP(px_, py_ - 3.5f * K * pulse, 5.5f * K * pulse, 5.5f * K * pulse, 0, pc);
-    rectP(px_ - 2.5f, py_ + 0.5f, 1, 1, RGB(255, 255, 255)); rectP(px_ + 1.5f, py_ + 0.5f, 1, 1, RGB(255, 255, 255)); rectP(px_ - 0.5f, py_ - 2, 1, 1, RGB(255, 255, 255)); }
-  snprintf(num, sizeof(num), "%d", hud.totalKills); textShadow(236, y, num, RGB(255, 255, 255), 1);
-  nextX = 236 + textWidthC(num);
-  if (hud.comboKills > 0) { snprintf(num, sizeof(num), "+%d", hud.comboKills); textShadow(nextX, y, num, RGB(255, 71, 120), 1); nextX += textWidthC(num); }
-  bootX = maxf(336, nextX + 28);
+    ellipseP(px_, py_ - 3.5f * K * pulse, 5.5f * K * pulse, 5.5f * K * pulse, 0, pc); }
+  snprintf(num, sizeof(num), "%d", hud.totalKills); textShadowS(182, y, num, RGB(255, 255, 255), 1);
+  nextX = 182 + textWidthS(num);
+  if (hud.comboKills > 0) { snprintf(num, sizeof(num), "+%d", hud.comboKills); textShadowS(nextX + 6, y, num, RGB(255, 71, 120), 1); nextX += 6 + textWidthS(num); }
+  bootX = maxf(262, nextX + 26);
   { float bx = bootX * K, by = y * K;
     rectP(bx - 2.5f, by - 2.5f, 7, 5.5f, RGB(9, 6, 14));
     rectP(bx + 1, by - 3, 3, 5.5f, RGB(255, 255, 255)); rectP(bx - 3, by, 7, 2.5f, RGB(255, 255, 255)); }
-  snprintf(num, sizeof(num), "%d", hud.steps); textShadow(bootX + 30, y, num, RGB(255, 255, 255), 1);
+  snprintf(num, sizeof(num), "%d", hud.steps); textShadowS(bootX + 22, y, num, RGB(255, 255, 255), 1);
   /* bonus feed */
   if (hud.feedAlpha > 0.01f && hud.nb > 0) {
-    float fy = 72;
+    float fy = 62;
     for (i = 0; i < hud.nb; i++) {
       snprintf(num, sizeof(num), "+%d %s", hud.bCount[i], hud.bLabel[i]);
-      textShadow(24 + (hud.bFlash[i] > 0.1f ? hud.bFlash[i] * 4 : 0), fy, num, hud.bFlash[i] > 0.2f ? RGB(255, 214, 234) : RGB(255, 255, 255), hud.feedAlpha);
-      fy += 26;
+      textShadowS(24 + (hud.bFlash[i] > 0.1f ? hud.bFlash[i] * 4 : 0), fy, num, hud.bFlash[i] > 0.2f ? RGB(255, 214, 234) : RGB(255, 255, 255), hud.feedAlpha);
+      fy += 17;
     }
   }
   /* hearts + dots + rating under the portrait */
@@ -1308,6 +1345,22 @@ static void drawPopups(void) {
     snprintf(num, sizeof(num), "+%d", p->value);
     textP(px - 6 + 1, py + 1, num, col(6, 8, 18, a), 1);
     textP(px - 6, py, num, p->value >= 11 ? col(82, 178, 255, a) : col(58, 139, 255, a), 1);
+  }
+}
+
+static void drawPsychoOverlay(float time) {            /* world layer: tint flashing over the scene */
+  float t = time * 3.2f, a = (0.045f + 0.035f * sinf(t * 2.1f)) * gPsycho;
+  if (gPsycho < 0.02f) return;
+  useZoom = 0;
+  rectP(0, 0, 480, 272, ca(sinf(t) > 0 ? 255 : 150, sinf(t * 0.7f) > 0.2f ? 40 : 120, sinf(t * 1.3f) > 0 ? 190 : 255, a));
+  rectP(0, 0, 480, 3, ca(255, 40, 140, 0.7f * gPsycho)); rectP(0, 269, 480, 3, ca(60, 200, 255, 0.7f * gPsycho));
+}
+static void drawPsychoBanner(float time) {
+  if (gPsycho > 0.3f && sinf(time * 9) > -0.35f) {
+    static const char *msg = "PSYCHO MODE";
+    unsigned int c = sinf(time * 6) > 0 ? RGB(255, 60, 150) : RGB(90, 230, 255);
+    textP(176 + 1, 5 + 1, msg, RGB(10, 5, 18), 2);
+    textP(176, 5, msg, c, 2);
   }
 }
 /* ---------- engine state ---------- */
@@ -1348,6 +1401,8 @@ static void engineUpdate(float dt, const SceCtrlData *pad, unsigned int pressed,
   float frontAvx, supportRiseTarget = 0, heartPower, antSpeedMult, gooAmount;
   int activeDots, isSmearingFront, prevFP, i, grindingPinned = 0;
   time_ += dt; gTime = time_;
+  gPsycho += ((musicWant ? 1.0f : 0.0f) - gPsycho) * minf(1, dt * 1.6f);
+  if (gPsycho > 0.5f) shakeMag = maxf(shakeMag, 1.4f * gPsycho);
   hintTimer = maxf(0, hintTimer - dt);
   shakeMag = maxf(0, shakeMag - dt * 36);
 
@@ -1360,8 +1415,8 @@ static void engineUpdate(float dt, const SceCtrlData *pad, unsigned int pressed,
     if (pad->Buttons & PSP_CTRL_UP) ay = -1;
     if (pad->Buttons & PSP_CTRL_DOWN) ay = 1;
     if (ax != 0 || ay != 0) hasInteracted = 1;
-    mouse.sx = clampf(mouse.sx + ax * 1150 * dt, 0, CW);
-    mouse.sy = clampf(mouse.sy + ay * 900 * dt, 0, CH);
+    mouse.sx = clampf(mouse.sx + ax * 1150 * dt * (1 + 0.35f * gPsycho), 0, CW);
+    mouse.sy = clampf(mouse.sy + ay * 900 * dt * (1 + 0.35f * gPsycho), 0, CH);
     mouse.x = clampf(CW * 0.5f + (mouse.sx - CW * 0.5f) / WORLD_ZOOM, 0, CW);
     mouse.y = clampf(CH + (mouse.sy - CH) / WORLD_ZOOM, 0, CH);
   }
@@ -1444,7 +1499,7 @@ static void engineUpdate(float dt, const SceCtrlData *pad, unsigned int pressed,
   audioDescent(frontFoot.vy, frontFoot.isGrounded);
   if (!frontFoot.isGrounded) audioStopCrunches();
 
-  antSpeedMult = 0.58f + activeDots * 0.355f;
+  antSpeedMult = (0.58f + activeDots * 0.355f) * (1 + 0.22f * gPsycho);
   enemiesUpdate(dt, &frontFoot, &backFoot, antSpeedMult);
   gooUpdate(dt); motesUpdate(dt);
   hudUpdate(dt);
@@ -1464,11 +1519,11 @@ static void buildFrame(void) {
   useZoom = 1;
   useBatch(&bA); drawCityAnim(time_); gooDrawGround(); drawTrash(); footShadow(&backFoot);
   useBatch(&bB); footGooRim(&backFoot); gooDrawStrands(&backFoot); drawAnts(); footShadow(&frontFoot);
-  useBatch(&bC); footGooRim(&frontFoot); gooDrawStrands(&frontFoot); gooDrawParticles(); drawPopups();
+  useBatch(&bC); footGooRim(&frontFoot); gooDrawStrands(&frontFoot); gooDrawParticles(); drawPopups(); drawPsychoOverlay(time_);
   { float sx_ = shakeX, sy_ = shakeY; shakeX = shakeY = 0;
     portraitCompute(time_, hud.comboKills);
     useBatch(&bD); portraitBuildBg();
-    useBatch(&bE); portraitBuildFg(); drawHudScreen(time_, hasInteracted, hintTimer);
+    useBatch(&bE); portraitBuildFg(); drawHudScreen(time_, hasInteracted, hintTimer); drawPsychoBanner(time_);
     /* cursor + overlays */
     { float cx = mouse.sx * K, cy = mouse.sy * K; unsigned int cc = (mouse.lmb || mouse.rmb) ? RGB(255, 126, 184) : RGB(255, 255, 255);
       if (started) { rectP(cx - 6, cy - 1, 4, 2, cc); rectP(cx + 3, cy - 1, 4, 2, cc); rectP(cx - 1, cy - 6, 2, 4, cc); rectP(cx - 1, cy + 3, 2, 4, cc); rectP(cx - 1, cy - 1, 2, 2, cc); } }
