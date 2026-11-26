@@ -13,6 +13,9 @@
 #include <string.h>
 #include <math.h>
 #include "poses.h"
+#include "poses_b.h"
+#include "poses_c.h"
+#include "chars.h"
 #include "sfx_ids.h"
 
 PSP_MODULE_INFO("ALTUHAGAME", 0, 1, 0);
@@ -38,13 +41,20 @@ static VC __attribute__((aligned(16))) vbB[MAXV_B];
 static VC __attribute__((aligned(16))) vbC[MAXV_B];
 static VC __attribute__((aligned(16))) vbD[MAXV_B];
 static VC __attribute__((aligned(16))) vbE[MAXV_B];
-static VT __attribute__((aligned(16))) tvLeg[2][6];
-static VT __attribute__((aligned(16))) tvBody[2][6];
+static VT __attribute__((aligned(16))) tvLeg[4][6];
+static VT __attribute__((aligned(16))) tvBody[4][6];
 static VT __attribute__((aligned(16))) tvCity[6];
 static VT __attribute__((aligned(16))) tvPort[6];
-static unsigned int __attribute__((aligned(16))) bootTex[NPOSE][256 * 256];
-static unsigned int __attribute__((aligned(16))) portTex[14][64 * 64];
-static int bootOk[NPOSE], cityOk = 0, portOk[14];
+#define NSLOT 7   /* poses the foot code really uses: 0,3,4,5,6,7,8 */
+static const int poseSlot[NPOSE] = {0, -1, -1, 1, 2, 3, 4, 5, 6, -1, -1};
+static unsigned int __attribute__((aligned(16))) bootTex[NCHAR][NSLOT][256 * 256];
+static unsigned int __attribute__((aligned(16))) portTex[NCHAR][14][64 * 64];
+static int bootOk[NCHAR][NSLOT], portOk[NCHAR][14];
+static int cityOk = 0;
+static int curChar = 0;                    /* 0 = boots, 1 = barefoot, 2 = striped sweater */
+static const PoseInfo *charPoses[NCHAR] = { POSES_A, POSES_B, POSES_C };
+static const PoseInfo *curPoses = POSES_A;
+#define POSES curPoses
 /* VRAM: draw 0x0, disp 0x88000, depth 0x110000; city textures live behind them (read from VRAM = fast) */
 #define VRAM_CITY_TOP 0x154000
 #define VRAM_CITY_BOT 0x194000
@@ -175,7 +185,7 @@ static void flushBatch(Batch *b) {
 static void useBatch(Batch *b) { CB = b; b->n = 0; b->nseg = 0; }
 
 /* 5x7 font: space, 0-9, A-Z */
-static const unsigned char glyph[41][7] = {
+static const unsigned char glyph[42][7] = {
   {0,0,0,0,0,0,0}, {14,17,19,21,25,17,14}, {4,12,4,4,4,4,14}, {14,17,1,2,4,8,31},
   {30,1,1,14,1,1,30}, {2,6,10,18,31,2,2}, {31,16,16,30,1,1,30}, {6,8,16,30,17,17,14},
   {31,1,2,4,8,8,8}, {14,17,17,14,17,17,14}, {14,17,17,15,1,2,12},
@@ -186,7 +196,7 @@ static const unsigned char glyph[41][7] = {
   {14,17,17,17,21,18,13}, {30,17,17,30,20,18,17}, {15,16,16,14,1,1,30}, {31,4,4,4,4,4,4},
   {17,17,17,17,17,17,14}, {17,17,17,17,17,10,4}, {17,17,17,21,21,21,10}, {17,17,10,4,10,17,17},
   {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31},
-  {0,4,4,31,4,4,0}, {0,12,12,0,12,12,0}, {0,0,0,31,0,0,0}, {0,0,0,0,0,12,12}
+  {0,4,4,31,4,4,0}, {0,12,12,0,12,12,0}, {0,0,0,31,0,0,0}, {0,0,0,0,0,12,12}, {4,4,4,4,4,0,4}
 };
 static void textP(float x, float y, const char *s, unsigned int c, int sc) {
   for (; *s; s++, x += 6 * sc) {
@@ -195,7 +205,7 @@ static void textP(float x, float y, const char *s, unsigned int c, int sc) {
     if (ch >= '0' && ch <= '9') id = 1 + ch - '0';
     else if (ch >= 'A' && ch <= 'Z') id = 11 + ch - 'A';
     else if (ch >= 'a' && ch <= 'z') id = 11 + ch - 'a';
-    else if (ch == '+') id = 37; else if (ch == ':') id = 38; else if (ch == '-') id = 39; else if (ch == '.') id = 40;
+    else if (ch == '+') id = 37; else if (ch == ':') id = 38; else if (ch == '-') id = 39; else if (ch == '.') id = 40; else if (ch == '!') id = 41;
     if (id == 0) continue;
     for (yy = 0; yy < 7; yy++) {
       xx = 0;
@@ -676,8 +686,8 @@ static void texDraw(VT *v) {
   sceKernelDcacheWritebackRange(v, 6 * sizeof(VT));
   sceGuDrawArray(GU_TRIANGLES, GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 6, 0, v);
 }
-static void footDraw(const Foot *f, int slot) {
-  const PoseInfo *p = &POSES[f->poseIdx];
+static void footDrawEx(const Foot *f, int slot, int ch, float alpha) {
+  const PoseInfo *p = &charPoses[ch][f->poseIdx];
   float sx = f->spriteScaleX, sy = f->spriteScaleY;
   float pW = p->wu * sx, pH = p->hu * sy, pLeft = -p->anchor * sx, pTop = -p->botY * sy;
   float extY = pTop + 3.0f * sy, extH = 620.0f, sh = p->slope * (sx / sy);
@@ -686,10 +696,10 @@ static void footDraw(const Foot *f, int slot) {
   float lx[4], ly[4], xs[4], ys[4];
   float kt = (float)p->hpx / p->hu;
   float rowV = 3.0f * kt + 0.5f;
-  unsigned int tint = f->isBack ? 0xffc2c2c2u : 0xffffffffu;
-  int i;
-  if (!bootOk[f->poseIdx]) return;
-  texBind(bootTex[f->poseIdx], p->tw, p->th, 1, GU_PSM_8888, 1);
+  unsigned int g = f->isBack ? 194u : 255u, tint = ((unsigned int)(clampf(alpha, 0, 1) * 255.0f) << 24) | (g << 16) | (g << 8) | g;
+  int i, sl = poseSlot[f->poseIdx];
+  if (sl < 0 || !bootOk[ch][sl] || alpha <= 0.01f) return;
+  texBind(bootTex[ch][sl], p->tw, p->th, 1, GU_PSM_8888, 1);
 #define XFORM(LX, LY, OX, OY) do { float a_ = (LX) * f->squashX, b_ = (LY) * f->squashY; a_ += b_ * f->smearShear; \
     float xr_ = a_ * c - b_ * s, yr_ = a_ * s + b_ * c; (OX) = wX(cx + xr_); (OY) = wY(cy + yr_); } while (0)
   lx[0] = pLeft - extH * sh;      ly[0] = extY - extH;
@@ -707,6 +717,7 @@ static void footDraw(const Foot *f, int slot) {
   sceGuDisable(GU_TEXTURE_2D);
 #undef XFORM
 }
+static void footDraw(const Foot *f, int slot) { footDrawEx(f, slot, curChar, 1.0f); }
 static void footShadow(const Foot *f) {
   float h = maxf(0, f->groundY - f->y);
   float alpha = clampf((f->isBack ? 0.42f : 0.60f) - h / 680.0f, 0.12f, 0.60f);
@@ -1203,16 +1214,18 @@ static void portraitCompute(float time, int combo) {
   PortraitView *v = &pview; float breath, bob, bounceY, swayX;
   v->fever = combo >= 30 || portrait.joyLevel > 0.72f;
   v->happy = portrait.happyTimer > 0 || combo >= 3 || portrait.joyLevel > 0.32f;
-  v->fIdx = v->happy ? hap[(int)(portrait.frameTimer * (v->fever ? 5.2f : 3.6f)) % 7] : idle[(int)(portrait.frameTimer * 1.4f) % 7];
+  { (void)idle; (void)hap;
+    v->fIdx = v->happy ? PORT_HAP[curChar][(int)(portrait.frameTimer * (v->fever ? 5.2f : 3.6f)) % PORT_NHAP[curChar]]
+                       : PORT_IDLE[curChar][(int)(portrait.frameTimer * 1.4f) % PORT_NIDLE[curChar]]; }
   breath = sinf(time * 2.4f) * 2.0f;
   bob = v->happy ? fabsf(sinf(time * (v->fever ? 11 : 6.5f))) * (v->fever ? 7.0f : 3.8f) : 0;
   bounceY = breath - bob - portrait.hitBounce * 5.5f;
   swayX = v->happy ? sinf(time * (v->fever ? 10 : 5.5f)) * (v->fever ? 3.5f : 1.5f) : 0;
-  v->th = PH * 0.96f; v->tw = 0.9697f * v->th;
+  v->th = PH * 0.96f; v->tw = ((float)PORT_WF[curChar][v->fIdx] / 64.0f) * v->th;
   v->dx = PX + (PW - v->tw) * 0.5f + swayX; v->dy = PY + (PH - v->th) + 8 + bounceY;
 }
 static void portraitBuildBg(void) {
-  int i; unsigned int ctr = pview.fever ? RGB(60, 32, 63) : RGB(44, 35, 52);
+  int i; unsigned int ctr = curChar == 0 ? (pview.fever ? RGB(60, 32, 63) : RGB(44, 35, 52)) : (curChar == 1 ? (pview.fever ? RGB(48, 46, 92) : RGB(32, 44, 70)) : (pview.fever ? RGB(66, 44, 66) : RGB(40, 40, 46)));
   float bx = (PX + 5) * K, by = (PY + 5) * K, bw = (PW - 10) * K, bh = (PH - 10) * K;
   useZoom = 0;
   rectP(PX * K, PY * K, PW * K, PH * K, RGB(26, 22, 31));
@@ -1223,12 +1236,12 @@ static void portraitBuildBg(void) {
 }
 static void portraitDrawTex(void) {
   float xs[4], ys[4], x0, y0, x1, y1;
-  if (!portOk[pview.fIdx]) return;
+  if (!portOk[curChar][pview.fIdx]) return;
   sceGuScissor((int)((PX + 5) * K), (int)((PY + 5) * K), (int)ceilf((PX + PW - 5) * K), (int)ceilf((PY + PH - 5) * K));
   x0 = pview.dx * K; y0 = pview.dy * K; x1 = (pview.dx + pview.tw) * K; y1 = (pview.dy + pview.th) * K;
   xs[0] = x0; ys[0] = y0; xs[1] = x1; ys[1] = y0; xs[2] = x1; ys[2] = y1; xs[3] = x0; ys[3] = y1;
-  texBind(portTex[pview.fIdx], 64, 64, 1, GU_PSM_8888, 1);
-  quadVT(tvPort, xs, ys, 0, 0, 62, 64, 0xffffffffu);
+  texBind(portTex[curChar][pview.fIdx], 64, 64, 1, GU_PSM_8888, 1);
+  quadVT(tvPort, xs, ys, 0, 0, (float)PORT_WF[curChar][pview.fIdx], 64, 0xffffffffu);
   texDraw(tvPort);
   sceGuDisable(GU_TEXTURE_2D);
   sceGuScissor(0, 0, 480, 272);
@@ -1336,7 +1349,9 @@ static void drawHudScreen(float time, int hasInter, float hintT) {
     textShadow(gx + 4, gy + 29, num, RGB(255, 255, 255), hud.comboKills > 0 ? 1 : clampf(hud.seriesFade, 0, 1));
   }
   if (!hasInter && hintT > 0)
-    textP(46, 232, "CROSS HOLD LOWER   TAP IN AIR OR CIRCLE  SLAM", col(242, 232, 247, (int)(clampf(hintT, 0, 1) * 255)), 1);
+  { int ha = (int)(clampf(hintT, 0, 1) * 255);
+    textP(46, 226, "CROSS HOLD LOWER   TAP IN AIR OR CIRCLE  SLAM", col(242, 232, 247, ha), 1);
+    textP(46, 238, "SELECT  CHANGE CHARACTER  TAKE OFF BOOTS", col(255, 160, 205, ha), 1); }
 }
 static void drawPopups(void) {
   int i; char num[16]; useZoom = 1;
@@ -1362,6 +1377,21 @@ static void drawPsychoBanner(float time) {
     textP(176 + 1, 5 + 1, msg, RGB(10, 5, 18), 2);
     textP(176, 5, msg, c, 2);
   }
+}
+
+static void drawSwitchFx(float flashA) {               /* white flash while the characters swap */
+  if (flashA <= 0.01f) return;
+  useZoom = 0;
+  rectP(0, 0, 480, 272, ca(255, 255, 255, flashA));
+}
+static void drawSwitchBanner(float t, int ch) {
+  static const char *names[NCHAR] = { "BOOTS ON!", "BOOTS OFF!", "STRIPES!" };
+  const char *msg = names[ch];
+  float a = clampf(t / 0.5f, 0, 1), w = (float)strlen(msg) * 12.0f;
+  unsigned int c = ch == 0 ? col(160, 220, 255, (int)(a * 255)) : (ch == 1 ? col(255, 190, 120, (int)(a * 255)) : col(235, 235, 235, (int)(a * 255)));
+  if (t <= 0) return;
+  textP((480 - w) * 0.5f + 1, 41, msg, col(10, 5, 18, (int)(a * 255)), 2);
+  textP((480 - w) * 0.5f, 40, msg, c, 2);
 }
 /* ---------- engine state ---------- */
 typedef struct { float x, y, sx, sy, prevY, vy, downAt; int lmb, rmb; } Mouse;
@@ -1397,6 +1427,19 @@ static void resetGame(void) {
   started = 1; paused = 0;
 }
 
+/* ---------- character switch ("taking off the boots") ---------- */
+#define GH_T 0.55f
+static Foot ghostFront, ghostBack;
+static float ghostT = 0, bannerT = 0;
+static int ghostChar = 0;
+static void switchCharacter(void) {
+  ghostFront = frontFoot; ghostBack = backFoot; ghostChar = curChar;
+  curChar = (curChar + 1) % NCHAR; curPoses = charPoses[curChar];
+  ghostT = GH_T; bannerT = 1.3f;
+  sfxThud(1.2f, 1); addShake(10.0f); gooShockwave(frontFoot.x, frontFoot.groundY + 2, 190);
+  frontFoot.landingRecoilVel = 55; frontFoot.squashX = 1.05f; frontFoot.squashY = 0.95f;
+}
+
 static void engineUpdate(float dt, const SceCtrlData *pad, unsigned int pressed, unsigned int released) {
   float frontAvx, supportRiseTarget = 0, heartPower, antSpeedMult, gooAmount;
   int activeDots, isSmearingFront, prevFP, i, grindingPinned = 0;
@@ -1404,6 +1447,7 @@ static void engineUpdate(float dt, const SceCtrlData *pad, unsigned int pressed,
   gPsycho += ((musicWant ? 1.0f : 0.0f) - gPsycho) * minf(1, dt * 1.6f);
   if (gPsycho > 0.5f) shakeMag = maxf(shakeMag, 1.4f * gPsycho);
   hintTimer = maxf(0, hintTimer - dt);
+  ghostT = maxf(0, ghostT - dt); bannerT = maxf(0, bannerT - dt);
   shakeMag = maxf(0, shakeMag - dt * 36);
 
   {
@@ -1519,16 +1563,16 @@ static void buildFrame(void) {
   useZoom = 1;
   useBatch(&bA); drawCityAnim(time_); gooDrawGround(); drawTrash(); footShadow(&backFoot);
   useBatch(&bB); footGooRim(&backFoot); gooDrawStrands(&backFoot); drawAnts(); footShadow(&frontFoot);
-  useBatch(&bC); footGooRim(&frontFoot); gooDrawStrands(&frontFoot); gooDrawParticles(); drawPopups(); drawPsychoOverlay(time_);
+  useBatch(&bC); footGooRim(&frontFoot); gooDrawStrands(&frontFoot); gooDrawParticles(); drawPopups(); drawPsychoOverlay(time_); drawSwitchFx(0.6f * (ghostT / GH_T) * (ghostT / GH_T));
   { float sx_ = shakeX, sy_ = shakeY; shakeX = shakeY = 0;
     portraitCompute(time_, hud.comboKills);
     useBatch(&bD); portraitBuildBg();
-    useBatch(&bE); portraitBuildFg(); drawHudScreen(time_, hasInteracted, hintTimer); drawPsychoBanner(time_);
+    useBatch(&bE); portraitBuildFg(); drawHudScreen(time_, hasInteracted, hintTimer); drawPsychoBanner(time_); drawSwitchBanner(bannerT, curChar);
     /* cursor + overlays */
     { float cx = mouse.sx * K, cy = mouse.sy * K; unsigned int cc = (mouse.lmb || mouse.rmb) ? RGB(255, 126, 184) : RGB(255, 255, 255);
       if (started) { rectP(cx - 6, cy - 1, 4, 2, cc); rectP(cx + 3, cy - 1, 4, 2, cc); rectP(cx - 1, cy - 6, 2, 4, cc); rectP(cx - 1, cy + 3, 2, 4, cc); rectP(cx - 1, cy - 1, 2, 2, cc); } }
     if (muted) textP(440, 262, "MUTE", RGB(165, 145, 174), 1);
-    if (paused) { rectP(150, 105, 180, 55, col(17, 11, 25, 220)); textP(206, 119, "PAUSED", RGB(238, 226, 242), 1); textP(168, 139, "START TO RESUME", RGB(255, 105, 165), 1); }
+    if (paused) { rectP(120, 92, 240, 84, col(17, 11, 25, 225)); textP(206, 100, "PAUSED", RGB(238, 226, 242), 1); textP(150, 120, "START   RESUME", RGB(255, 105, 165), 1); textP(150, 134, "SELECT  CHANGE CHARACTER", RGB(255, 190, 120), 1); textP(150, 148, "SQUARE  SOUND ON OFF", RGB(160, 220, 255), 1); }
     shakeX = sx_; shakeY = sy_; }
   (void)k;
 }
@@ -1539,9 +1583,12 @@ static void submitFrame(void) {
   useZoom = 1;
   drawCityTex();
   flushBatch(&bA);
-  footDraw(&backFoot, 0);
-  flushBatch(&bB);
-  footDraw(&frontFoot, 1);
+  { float gk = ghostT / GH_T, real = 1.0f - 0.85f * gk;
+    footDrawEx(&backFoot, 0, curChar, real);
+    if (ghostT > 0) footDrawEx(&ghostBack, 2, ghostChar, gk);
+    flushBatch(&bB);
+    footDrawEx(&frontFoot, 1, curChar, real);
+    if (ghostT > 0) footDrawEx(&ghostFront, 3, ghostChar, gk); }
   flushBatch(&bC);
   sceGuScissor((int)(PX * K), (int)(PY * K), (int)ceilf((PX + PW) * K), (int)ceilf((PY + PH) * K));
   flushBatch(&bD);
@@ -1602,22 +1649,28 @@ int main(int argc, char **argv) {
   }
   snprintf(m, sizeof(m), "base: %s", base); say(m);
   for (i = 0; i < NPOSE; i++) {
-    char p[64]; snprintf(p, sizeof(p), "assets/boot_%02d.rgba", i);
-    bootOk[i] = (loadFile(ap(p), bootTex[i], 256 * 256 * 4) == 256 * 256 * 4);
-    if (bootOk[i]) { sceKernelDcacheWritebackRange(bootTex[i], 256 * 256 * 4); loaded++; }
+    int ch, sl = poseSlot[i];
+    if (sl < 0) continue;
+    for (ch = 0; ch < NCHAR; ch++) {
+      static const char *fp[NCHAR] = { "boot", "bare", "strp" };
+      char p[64]; snprintf(p, sizeof(p), "assets/%s_%02d.rgba", fp[ch], i);
+      bootOk[ch][sl] = (loadFile(ap(p), bootTex[ch][sl], 256 * 256 * 4) == 256 * 256 * 4);
+      if (bootOk[ch][sl]) { sceKernelDcacheWritebackRange(bootTex[ch][sl], 256 * 256 * 4); loaded++; }
+    }
   }
-  for (i = 0; i < 14; i++) {
-    char p[64]; snprintf(p, sizeof(p), "assets/portrait_%02d.rgba", i);
-    portOk[i] = (loadFile(ap(p), portTex[i], 64 * 64 * 4) == 64 * 64 * 4);
-    if (portOk[i]) { sceKernelDcacheWritebackRange(portTex[i], 64 * 64 * 4); ploaded++; }
-  }
+  { int ch; static const char *pp[NCHAR] = { "portrait", "bport", "sport" };
+    for (ch = 0; ch < NCHAR; ch++) for (i = 0; i < PORT_COUNT[ch]; i++) {
+      char p[64]; snprintf(p, sizeof(p), "assets/%s_%02d.rgba", pp[ch], i);
+      portOk[ch][i] = (loadFile(ap(p), portTex[ch][i], 64 * 64 * 4) == 64 * 64 * 4);
+      if (portOk[ch][i]) { sceKernelDcacheWritebackRange(portTex[ch][i], 64 * 64 * 4); ploaded++; }
+    } }
   { static unsigned char cbuf[65536]; int ok1 = 0, ok2 = 0, n, tot;
     FILE *fc = fopen(ap("assets/city_top.565"), "rb");
     if (fc) { tot = 0; while ((n = (int)fread(cbuf, 1, sizeof(cbuf), fc)) > 0 && tot + n <= 0x40000) { memcpy((unsigned char *)VRAM_CPU(VRAM_CITY_TOP) + tot, cbuf, n); tot += n; } fclose(fc); ok1 = (tot == 0x40000); }
     fc = fopen(ap("assets/city_bot.565"), "rb");
     if (fc) { tot = 0; while ((n = (int)fread(cbuf, 1, sizeof(cbuf), fc)) > 0 && tot + n <= 0x10000) { memcpy((unsigned char *)VRAM_CPU(VRAM_CITY_BOT) + tot, cbuf, n); tot += n; } fclose(fc); ok2 = (tot == 0x10000); }
     cityOk = ok1 && ok2; }
-  snprintf(m, sizeof(m), "boots %d/%d  portraits %d/14  city %d", loaded, NPOSE, ploaded, cityOk); say(m);
+  snprintf(m, sizeof(m), "feet %d/21  portraits %d/38  city %d", loaded, ploaded, cityOk); say(m);
   sc = loadSfx(); snprintf(m, sizeof(m), "sfx pack: %d sounds", sc); say(m);
   sceKernelDelayThread(1200000);
   say("starting graphics..."); sceKernelDelayThread(400000);
@@ -1644,7 +1697,8 @@ int main(int argc, char **argv) {
     if (dt > 0.05f) dt = 0.05f;
     pressed = pad.Buttons & ~prevBtn; released = ~pad.Buttons & prevBtn; prevBtn = pad.Buttons;
     if (pressed & PSP_CTRL_START) paused = !paused;
-    if (pressed & PSP_CTRL_SELECT) muted = !muted;
+    if (pressed & PSP_CTRL_SELECT) { if (!paused) switchCharacter(); }
+    if (paused && (pressed & PSP_CTRL_SQUARE)) muted = !muted;
     musicPaused = paused; musicTarget = (musicWant && !muted) ? MUSIC_VOL : 0.0f;
     if (!paused) engineUpdate(dt, &pad, pressed, released);
     else { audioSmearUpdate(0, 0, 0, 0, 0, 0); audioDescent(0, 1); }
